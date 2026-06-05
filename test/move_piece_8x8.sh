@@ -1,12 +1,34 @@
 #!/bin/bash
 
-ARM=${1}
+ARM=${1,,}
 START=${2^^}
 END=${3^^}
 
-Z_UP=${Z_UP:-90}
-Z_PICK=${Z_PICK:-59}
-Z_PLACE=${Z_PLACE:-60}
+if [ -z "$ARM" ] || [ -z "$START" ] || [ -z "$END" ]; then
+  echo "Usage: $0 arm1|arm2 START END"
+  echo "Example: $0 arm1 A2 A4"
+  echo "Example: $0 arm1 D4 CAP1_1"
+  exit 1
+fi
+
+case "$ARM" in
+  arm1)
+    TOPIC="/arm1/raw_cmd"
+    ;;
+  arm2)
+    TOPIC="/arm2/raw_cmd"
+    ;;
+  *)
+    echo "ERROR: ARM must be arm1 or arm2"
+    exit 1
+    ;;
+esac
+
+# New board defaults: old Z values +10mm for 1cm urethane board.
+Z_UP=${Z_UP:-100}
+HOME_Z=${HOME_Z:-100}
+Z_PICK=${Z_PICK:-69}
+Z_PLACE=${Z_PLACE:-70}
 
 F_FAST=${F_FAST:-1800}
 F_SLOW=${F_SLOW:-600}
@@ -15,34 +37,20 @@ F_HOME=${F_HOME:-1800}
 SLEEP_TIME=${SLEEP_TIME:-0.15}
 RELEASE_SLEEP=${RELEASE_SLEEP:-0.1}
 
-POSE="A0 B0 C0"
+HOME_X=${HOME_X:-200}
+HOME_Y=${HOME_Y:-0}
 
-HOME_X=200
-HOME_Y=0
-HOME_Z=${HOME_Z:-90}
+SUCTION_ON=${SUCTION_ON:-M3S1000}
+SUCTION_OFF=${SUCTION_OFF:-M3S0}
 
-if [ -z "$ARM" ] || [ -z "$START" ] || [ -z "$END" ]; then
-  echo "Usage: ./test/move_piece_8x8.sh arm1|arm2 START END"
-  echo "Example:"
-  echo "  ./test/move_piece_8x8.sh arm1 A1 B1"
-  echo "  ./test/move_piece_8x8.sh arm2 H8 G8"
-  echo "  ./test/move_piece_8x8.sh arm1 A1 D45"
-  echo "  ./test/move_piece_8x8.sh arm2 D45 G7"
-  echo ""
-  echo "Relay points: C45 D45 E45 F45"
-  exit 1
-fi
+send_cmd() {
+  local CMD="$1"
+  echo "SEND[$ARM]: $CMD"
+  ros2 topic pub --once "$TOPIC" std_msgs/msg/String "{data: '$CMD'}"
+  sleep "$SLEEP_TIME"
+}
 
-if [ "$ARM" = "arm1" ]; then
-  TOPIC="/arm1/raw_cmd"
-elif [ "$ARM" = "arm2" ]; then
-  TOPIC="/arm2/raw_cmd"
-else
-  echo "ARM must be arm1 or arm2"
-  exit 1
-fi
-
-file_idx() {
+file_index() {
   case "$1" in
     A) echo 0 ;;
     B) echo 1 ;;
@@ -52,140 +60,159 @@ file_idx() {
     F) echo 5 ;;
     G) echo 6 ;;
     H) echo 7 ;;
-    *) echo "ERR" ;;
+    *) echo "ERROR" ;;
   esac
 }
 
-is_relay_cell() {
-  CELL=$1
-  FILE=${CELL:0:1}
-  RANK_PART=${CELL:1}
+regular_cell_xy() {
+  local ARM_NAME="$1"
+  local CELL="$2"
 
-  if [ "$RANK_PART" = "45" ]; then
-    case "$FILE" in
-      C|D|E|F)
-        return 0
-        ;;
-    esac
+  local FILE="${CELL:0:1}"
+  local RANK="${CELL:1}"
+
+  local IDX
+  IDX=$(file_index "$FILE")
+
+  if [ "$IDX" = "ERROR" ]; then
+    echo "ERROR: invalid file in cell $CELL" >&2
+    return 1
   fi
 
-  return 1
-}
-
-check_cell() {
-  CELL=$1
-  FILE=${CELL:0:1}
-  RANK_PART=${CELL:1}
-  IDX=$(file_idx "$FILE")
-
-  if [ "$IDX" = "ERR" ]; then
-    echo "Invalid file in cell: $CELL"
-    exit 1
+  if ! [[ "$RANK" =~ ^[1-8]$ ]]; then
+    echo "ERROR: invalid rank in cell $CELL" >&2
+    return 1
   fi
 
-  if is_relay_cell "$CELL"; then
-    return
-  fi
+  local X
+  local Y
 
-  if ! [[ "$RANK_PART" =~ ^[1-8]$ ]]; then
-    echo "Invalid cell: $CELL"
-    echo "Allowed normal cells: A1~H8"
-    echo "Allowed relay points: C45 D45 E45 F45"
-    exit 1
-  fi
-}
-
-get_xy() {
-  CELL=$1
-  FILE=${CELL:0:1}
-  RANK_PART=${CELL:1}
-  IDX=$(file_idx "$FILE")
-
-  if [ "$ARM" = "arm1" ]; then
-    # arm1:
-    # A1 = X120 Y150
-    # rank +1 => X +40
-    # A -> H => Y -40
-
-    if is_relay_cell "$CELL"; then
-      X=260
-      Y=$((150 - IDX * 40))
-    else
-      RANK=$RANK_PART
-      X=$((120 + (RANK - 1) * 40))
-      Y=$((150 - IDX * 40))
-
-      if [ "$RANK" -gt 4 ]; then
-        echo "WARNING: arm1 target $CELL is beyond rank 4. Check reachability." >&2
-      fi
-    fi
-
-  elif [ "$ARM" = "arm2" ]; then
-    # arm2:
-    # H8 = X120 Y150
-    # rank -1 => X +40
-    # A -> H => Y +40
-
-    if is_relay_cell "$CELL"; then
-      X=260
-      Y=$((-130 + IDX * 40))
-    else
-      RANK=$RANK_PART
-      X=$((120 + (8 - RANK) * 40))
-      Y=$((-130 + IDX * 40))
-
-      if [ "$RANK" -lt 5 ]; then
-        echo "WARNING: arm2 target $CELL is below rank 5. Check reachability." >&2
-      fi
-    fi
+  if [ "$ARM_NAME" = "arm1" ]; then
+    # arm1 new board calibration:
+    # A2 = X145 Y145
+    # A4 = X225 Y145
+    # H2 = X145 Y-140
+    # X direction: 40mm per rank
+    # Y direction: A~H total 285mm, divided by 7 intervals
+    X=$((105 + (RANK - 1) * 40))
+    Y=$((145 - (IDX * 285) / 7))
+  else
+    # arm2 is still using previous calibration.
+    # Recalibrate arm2 after arm1 test.
+    X=$((120 + (8 - RANK) * 40))
+    Y=$((-130 + IDX * 40))
   fi
 
   echo "$X $Y"
 }
 
-send_cmd() {
-  CMD="$1"
-  echo "SEND: $CMD"
-  ros2 topic pub --once "$TOPIC" std_msgs/msg/String "{data: '$CMD'}"
-  sleep "$SLEEP_TIME"
+relay_xy() {
+  local ARM_NAME="$1"
+  local RELAY="$2"
+
+  local FILE="${RELAY:0:1}"
+  local IDX
+  IDX=$(file_index "$FILE")
+
+  if [ "$IDX" = "ERROR" ]; then
+    echo "ERROR: invalid relay $RELAY" >&2
+    return 1
+  fi
+
+  local X=260
+  local Y
+
+  if [ "$ARM_NAME" = "arm1" ]; then
+    Y=$((145 - (IDX * 285) / 7))
+  else
+    Y=$((-130 + IDX * 40))
+  fi
+
+  echo "$X $Y"
 }
 
-check_cell "$START"
-check_cell "$END"
+capture_xy() {
+  local ARM_NAME="$1"
+  local CAP="$2"
 
-read SX SY <<< "$(get_xy "$START")"
-read EX EY <<< "$(get_xy "$END")"
+  case "$ARM_NAME:$CAP" in
+    arm1:CAP1_1) echo "105 -180" ;;
+    arm1:CAP1_2) echo "145 -180" ;;
+    arm1:CAP1_3) echo "185 -180" ;;
+    arm1:CAP1_4) echo "225 -180" ;;
 
-echo "======================================"
-echo "MOVE 8x8 / FAST RELAY POINT READY"
-echo "ARM:   $ARM"
+    arm2:CAP2_1) echo "95 185" ;;
+    arm2:CAP2_2) echo "135 185" ;;
+    arm2:CAP2_3) echo "175 185" ;;
+    arm2:CAP2_4) echo "215 185" ;;
+
+    arm1:CAP2_*|arm2:CAP1_*)
+      echo "ERROR: $CAP is not for $ARM_NAME" >&2
+      return 1
+      ;;
+
+    *)
+      echo "ERROR: unknown capture slot $CAP for $ARM_NAME" >&2
+      return 1
+      ;;
+  esac
+}
+
+cell_xy() {
+  local ARM_NAME="$1"
+  local CELL="$2"
+
+  case "$CELL" in
+    CAP1_*|CAP2_*)
+      capture_xy "$ARM_NAME" "$CELL"
+      ;;
+    C45|D45|E45|F45)
+      relay_xy "$ARM_NAME" "$CELL"
+      ;;
+    [A-H][1-8])
+      regular_cell_xy "$ARM_NAME" "$CELL"
+      ;;
+    *)
+      echo "ERROR: unknown cell or slot: $CELL" >&2
+      return 1
+      ;;
+  esac
+}
+
+START_XY=$(cell_xy "$ARM" "$START") || exit 1
+END_XY=$(cell_xy "$ARM" "$END") || exit 1
+
+START_X=$(echo "$START_XY" | awk '{print $1}')
+START_Y=$(echo "$START_XY" | awk '{print $2}')
+END_X=$(echo "$END_XY" | awk '{print $1}')
+END_Y=$(echo "$END_XY" | awk '{print $2}')
+
+echo "ARM: $ARM"
 echo "TOPIC: $TOPIC"
-echo "START: $START -> X$SX Y$SY"
-echo "END:   $END -> X$EX Y$EY"
-echo "Z_UP:    $Z_UP"
-echo "Z_PICK:  $Z_PICK"
-echo "Z_PLACE: $Z_PLACE"
-echo "F_FAST:  $F_FAST"
-echo "F_SLOW:  $F_SLOW"
-echo "======================================"
+echo "START: $START -> X$START_X Y$START_Y"
+echo "END:   $END -> X$END_X Y$END_Y"
+echo "Z_UP=$Z_UP Z_PICK=$Z_PICK Z_PLACE=$Z_PLACE HOME_Z=$HOME_Z"
+echo "F_FAST=$F_FAST F_SLOW=$F_SLOW F_HOME=$F_HOME"
 
-source /opt/ros/humble/setup.bash
-source /root/chess_robot_project/ros_ws/install/setup.bash
+send_cmd "$SUCTION_OFF"
 
-send_cmd "M3S0"
+send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$Z_UP A0 B0 C0 F$F_FAST"
 
-send_cmd "M20 G90 G0 X${SX} Y${SY} Z${Z_UP} ${POSE} F${F_FAST}"
-send_cmd "M20 G90 G0 X${SX} Y${SY} Z${Z_PICK} ${POSE} F${F_SLOW}"
-send_cmd "M3S1000"
-send_cmd "M20 G90 G0 X${SX} Y${SY} Z${Z_UP} ${POSE} F${F_SLOW}"
+send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$Z_PICK A0 B0 C0 F$F_SLOW"
+send_cmd "$SUCTION_ON"
+sleep "$SLEEP_TIME"
 
-send_cmd "M20 G90 G0 X${EX} Y${EY} Z${Z_UP} ${POSE} F${F_FAST}"
-send_cmd "M20 G90 G0 X${EX} Y${EY} Z${Z_PLACE} ${POSE} F${F_SLOW}"
-send_cmd "M3S0"
+send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$Z_UP A0 B0 C0 F$F_SLOW"
 
+send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$Z_UP A0 B0 C0 F$F_FAST"
+
+send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$Z_PLACE A0 B0 C0 F$F_SLOW"
+send_cmd "$SUCTION_OFF"
 sleep "$RELEASE_SLEEP"
 
-send_cmd "M20 G90 G0 X${EX} Y${EY} Z${Z_UP} ${POSE} F${F_SLOW}"
-send_cmd "M20 G90 G0 X${HOME_X} Y${HOME_Y} Z${HOME_Z} ${POSE} F${F_HOME}"
+send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$Z_UP A0 B0 C0 F$F_SLOW"
 
-echo "DONE"
+send_cmd "$SUCTION_OFF"
+send_cmd "M20 G90 G0 X$HOME_X Y$HOME_Y Z$HOME_Z A0 B0 C0 F$F_HOME"
+
+echo "DONE: $ARM $START -> $END"
