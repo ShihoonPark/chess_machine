@@ -136,7 +136,7 @@ echo "END_ARM:   $END_ARM"
 echo "Z_UP=$Z_UP Z_PICK=$Z_PICK Z_PLACE=$Z_PLACE HOME_Z=$HOME_Z"
 echo "F_FAST=$F_FAST F_SLOW=$F_SLOW F_HOME=$F_HOME"
 echo "SLEEP_TIME=$SLEEP_TIME RELEASE_SLEEP=$RELEASE_SLEEP"
-echo "NOTE: piece rule validation is handled by TOPST later."
+echo "NOTE: piece rule validation is handled by TOPST before robot execution."
 echo "======================================"
 
 echo "[INIT] Move both arms home"
