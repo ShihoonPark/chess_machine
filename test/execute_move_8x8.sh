@@ -4,19 +4,27 @@
 #   ./test/execute_move_8x8.sh A2 A4 pawn
 #   ./test/execute_move_8x8.sh A7 A5 pawn
 #   ./test/execute_move_8x8.sh A2 A6 pawn
+#   ./test/execute_move_8x8.sh A2 A6 pawn D45
 #
 # Role:
 #   This script only decides direct vs relay and calls move_piece_8x8.sh.
 #   It must NOT set Z values, home values, or raw_cmd directly.
 #   All actual robot movement, Z, suction, timing, and home return are handled by move_piece_8x8.sh.
+#
+# Optional 4th argument:
+#   RELAY can be C45/D45/E45/F45.
+#   If provided for a cross-arm move, this script uses that relay instead of choosing one automatically.
+#   FastAPI can use this to avoid occupied relay-neighbor cells.
 
 START=${1^^}
 END=${2^^}
 PIECE=${3,,}
+REQUESTED_RELAY=${4^^}
 
 if [ -z "$START" ] || [ -z "$END" ]; then
-  echo "Usage: $0 START END [piece]"
+  echo "Usage: $0 START END [piece] [relay]"
   echo "Example: $0 A2 A4 pawn"
+  echo "Example: $0 A2 A6 pawn D45"
   exit 1
 fi
 
@@ -62,6 +70,20 @@ validate_cell() {
     echo "ERROR: invalid rank in cell $CELL"
     exit 1
   fi
+}
+
+validate_relay() {
+  local RELAY="$1"
+
+  case "$RELAY" in
+    C45|D45|E45|F45)
+      return 0
+      ;;
+    *)
+      echo "ERROR: invalid relay $RELAY. Use one of C45/D45/E45/F45."
+      exit 1
+      ;;
+  esac
 }
 
 arm_for_cell() {
@@ -138,6 +160,10 @@ if [ "$START" = "$END" ]; then
   exit 1
 fi
 
+if [ -n "$REQUESTED_RELAY" ]; then
+  validate_relay "$REQUESTED_RELAY"
+fi
+
 START_ARM=$(arm_for_cell "$START")
 END_ARM=$(arm_for_cell "$END")
 
@@ -149,12 +175,24 @@ echo "END_ARM=$END_ARM"
 
 if [ "$START_ARM" = "$END_ARM" ]; then
   echo "MODE=direct"
+
+  if [ -n "$REQUESTED_RELAY" ]; then
+    echo "REQUESTED_RELAY=$REQUESTED_RELAY"
+    echo "INFO: relay argument ignored for direct move"
+  fi
+
   run_move "$START_ARM" "$START" "$END"
   echo "DONE: direct $START -> $END"
   exit 0
 fi
 
-RELAY=$(choose_relay "$START" "$END")
+if [ -n "$REQUESTED_RELAY" ]; then
+  RELAY="$REQUESTED_RELAY"
+  echo "RELAY_SOURCE=provided"
+else
+  RELAY=$(choose_relay "$START" "$END")
+  echo "RELAY_SOURCE=auto"
+fi
 
 if [ "$RELAY" = "ERROR" ] || [ -z "$RELAY" ]; then
   echo "ERROR: failed to choose relay"

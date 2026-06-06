@@ -38,6 +38,25 @@ CAPTURE_SLOTS = {
     "arm2": ["CAP2_1", "CAP2_2", "CAP2_3"],
 }
 
+RELAY_CANDIDATES = {
+    "C45": {
+        "file_index": 2,
+        "guard_cells": ["C4", "C5"],
+    },
+    "D45": {
+        "file_index": 3,
+        "guard_cells": ["D4", "D5"],
+    },
+    "E45": {
+        "file_index": 4,
+        "guard_cells": ["E4", "E5"],
+    },
+    "F45": {
+        "file_index": 5,
+        "guard_cells": ["F4", "F5"],
+    },
+}
+
 capture_next_index = {
     "arm1": 0,
     "arm2": 0,
@@ -140,7 +159,6 @@ class TopstConsole:
 
     def start_rule_checker(self):
         self.open()
-
         self.wake_and_login()
 
         self.send_line("cd /home/root")
@@ -170,7 +188,6 @@ class TopstConsole:
     def extract_response(self, raw: str, command: str):
         command = command.strip()
         result = None
-
         lines = raw.replace("\r", "\n").split("\n")
 
         for line in lines:
@@ -205,7 +222,6 @@ class TopstConsole:
 
     def command(self, command: str, timeout: float = 3.0) -> str:
         self.ensure_started()
-
         self.send_line(command)
 
         end_time = time.time() + timeout
@@ -237,6 +253,10 @@ def rank_of_cell(cell: str) -> int:
     return int(cell[1])
 
 
+def file_index_of_cell(cell: str) -> int:
+    return FILES.index(cell[0])
+
+
 def arm_for_cell(cell: str) -> str:
     rank = rank_of_cell(cell)
 
@@ -247,6 +267,102 @@ def arm_for_cell(cell: str) -> str:
         return "arm2"
 
     raise ValueError(f"Invalid rank in cell: {cell}")
+
+
+def parse_topst_board_response(response: str):
+    board = {}
+    turn = "unknown"
+    pending = "unknown"
+
+    for token in response.strip().split():
+        if token.startswith("turn="):
+            turn = token.split("=", 1)[1]
+            continue
+
+        if token.startswith("pending="):
+            pending = token.split("=", 1)[1]
+            continue
+
+        if ":" in token:
+            cell, piece_value = token.split(":", 1)
+
+            if cell in ALLOWED_CELLS and piece_value:
+                board[cell] = piece_value
+
+    return {
+        "board": board,
+        "turn": turn,
+        "pending": pending,
+        "raw": response,
+    }
+
+
+def relay_candidate_order(start: str, end: str):
+    start_idx = file_index_of_cell(start)
+    end_idx = file_index_of_cell(end)
+    center = (start_idx + end_idx) / 2.0
+
+    return sorted(
+        RELAY_CANDIDATES.keys(),
+        key=lambda relay: (
+            abs(RELAY_CANDIDATES[relay]["file_index"] - center),
+            abs(RELAY_CANDIDATES[relay]["file_index"] - start_idx)
+            + abs(RELAY_CANDIDATES[relay]["file_index"] - end_idx),
+            RELAY_CANDIDATES[relay]["file_index"],
+        ),
+    )
+
+
+def choose_safe_relay(start: str, end: str, board_state: dict):
+    if arm_for_cell(start) == arm_for_cell(end):
+        return {
+            "required": False,
+            "selected": None,
+            "reason": "direct_move",
+            "checked": [],
+        }
+
+    ignored_cells = {start, end}
+    ordered_candidates = relay_candidate_order(start, end)
+    checked = []
+
+    for relay in ordered_candidates:
+        guard_cells = RELAY_CANDIDATES[relay]["guard_cells"]
+        blockers = []
+
+        for cell in guard_cells:
+            # start는 곧 비워지고, end는 capture가 있으면 먼저 치워진 뒤 공격 기물이 들어간다.
+            # 그래서 start/end 자체는 relay 주변 점유 검사에서 예외로 둔다.
+            if cell in ignored_cells:
+                continue
+
+            if cell in board_state:
+                blockers.append({
+                    "cell": cell,
+                    "piece": board_state[cell],
+                })
+
+        checked.append({
+            "relay": relay,
+            "guard_cells": guard_cells,
+            "blockers": blockers,
+            "available": len(blockers) == 0,
+        })
+
+        if len(blockers) == 0:
+            return {
+                "required": True,
+                "selected": relay,
+                "reason": "safe_relay_found",
+                "checked": checked,
+            }
+
+    return {
+        "required": True,
+        "selected": None,
+        "reason": "no_safe_relay_available",
+        "checked": checked,
+    }
 
 
 def reset_capture_slots():
@@ -358,8 +474,9 @@ def health():
         "move_piece_script_exists": MOVE_PIECE_SCRIPT.exists(),
         "topst_port": TOPST_PORT,
         "topst_port_exists": os.path.exists(TOPST_PORT),
-        "mode": "8x8_dual_arm_execute_with_topst_rule_checker_and_capture",
+        "mode": "8x8_dual_arm_execute_with_topst_rule_checker_capture_relay_avoidance",
         "capture_slots": get_capture_status(),
+        "relay_candidates": RELAY_CANDIDATES,
     }
 
 
@@ -443,11 +560,41 @@ def execute_move(req: ExecuteRequest):
                     },
                 )
 
+            # 2. TOPST board_state 기준으로 relay 주변 점유 여부 확인
+            try:
+                board_response = topst.command("BOARD", timeout=4.0)
+                parsed_board = parse_topst_board_response(board_response)
+                relay_info = choose_safe_relay(start, end, parsed_board["board"])
+            except Exception as e:
+                cancel_response = cancel_pending_topst()
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Relay safety check failed",
+                        "topst_req": topst_req,
+                        "topst_cancel": cancel_response,
+                        "error": str(e),
+                    },
+                )
+
+            if relay_info["required"] and relay_info["selected"] is None:
+                cancel_response = cancel_pending_topst()
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "message": "No safe relay available",
+                        "topst_req": topst_req,
+                        "topst_board": board_response,
+                        "topst_cancel": cancel_response,
+                        "relay": relay_info,
+                    },
+                )
+
             captured_piece = parse_capture_from_topst_response(topst_req)
             capture_info = None
             robot_steps = []
 
-            # 2. Capture가 있으면 먼저 end 칸의 잡힌 기물을 CAP slot으로 이동
+            # 3. Capture가 있으면 먼저 end 칸의 잡힌 기물을 CAP slot으로 이동
             if captured_piece is not None:
                 capture_arm = arm_for_cell(end)
 
@@ -489,6 +636,7 @@ def execute_move(req: ExecuteRequest):
                             "topst_req": topst_req,
                             "topst_cancel": cancel_response,
                             "capture": capture_info,
+                            "relay": relay_info,
                         },
                     )
                 except Exception as e:
@@ -500,6 +648,7 @@ def execute_move(req: ExecuteRequest):
                             "topst_req": topst_req,
                             "topst_cancel": cancel_response,
                             "capture": capture_info,
+                            "relay": relay_info,
                             "error": str(e),
                         },
                     )
@@ -515,6 +664,7 @@ def execute_move(req: ExecuteRequest):
                             "topst_req": topst_req,
                             "topst_cancel": cancel_response,
                             "capture": capture_info,
+                            "relay": relay_info,
                             "stdout": capture_result.stdout,
                             "stderr": capture_result.stderr,
                         },
@@ -523,11 +673,16 @@ def execute_move(req: ExecuteRequest):
                 # 실제 잡힌 기물이 CAP slot으로 이동 성공한 뒤에만 slot 사용 처리.
                 mark_capture_slot_used(capture_arm, capture_slot)
 
-            # 3. 공격 기물을 start -> end로 이동
+            # 4. 공격 기물을 start -> end로 이동
             try:
+                attack_args = [start, end, piece]
+
+                if relay_info["required"] and relay_info["selected"]:
+                    attack_args.append(relay_info["selected"])
+
                 attack_result = run_robot_script(
                     EXECUTE_SCRIPT,
-                    [start, end, piece],
+                    attack_args,
                     timeout=300,
                 )
             except subprocess.TimeoutExpired:
@@ -539,6 +694,7 @@ def execute_move(req: ExecuteRequest):
                         "topst_req": topst_req,
                         "topst_cancel": cancel_response,
                         "capture": capture_info,
+                        "relay": relay_info,
                         "robot_steps": robot_steps,
                     },
                 )
@@ -551,6 +707,7 @@ def execute_move(req: ExecuteRequest):
                         "topst_req": topst_req,
                         "topst_cancel": cancel_response,
                         "capture": capture_info,
+                        "relay": relay_info,
                         "robot_steps": robot_steps,
                         "error": str(e),
                     },
@@ -558,7 +715,7 @@ def execute_move(req: ExecuteRequest):
 
             robot_steps.append(format_robot_step("attack", attack_result))
 
-            # 4. 공격 기물 이동 실패 시 TOPST 상태 업데이트 취소
+            # 5. 공격 기물 이동 실패 시 TOPST 상태 업데이트 취소
             if attack_result.returncode != 0:
                 cancel_response = cancel_pending_topst()
                 raise HTTPException(
@@ -568,13 +725,14 @@ def execute_move(req: ExecuteRequest):
                         "topst_req": topst_req,
                         "topst_cancel": cancel_response,
                         "capture": capture_info,
+                        "relay": relay_info,
                         "robot_steps": robot_steps,
                         "stdout": attack_result.stdout,
                         "stderr": attack_result.stderr,
                     },
                 )
 
-            # 5. 전체 로봇 동작 성공 시 COMMIT
+            # 6. 전체 로봇 동작 성공 시 COMMIT
             try:
                 commit_response = topst.command("COMMIT", timeout=3.0)
             except Exception as e:
@@ -584,6 +742,7 @@ def execute_move(req: ExecuteRequest):
                         "message": "Robot moved, but TOPST COMMIT failed",
                         "topst_req": topst_req,
                         "capture": capture_info,
+                        "relay": relay_info,
                         "robot_steps": robot_steps,
                         "error": str(e),
                     },
@@ -595,6 +754,7 @@ def execute_move(req: ExecuteRequest):
         "end": end,
         "piece": piece,
         "capture": capture_info,
+        "relay": relay_info,
         "topst_req": topst_req,
         "topst_commit": commit_response,
         "robot_steps": robot_steps,
