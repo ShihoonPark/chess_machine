@@ -127,7 +127,7 @@
     }
 
     .panel {
-      width: 390px;
+      width: 430px;
       background: #2b2c2f;
       padding: 20px;
       border-radius: 14px;
@@ -167,6 +167,11 @@
       background: #3976e6;
     }
 
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
     button.secondary {
       background: #666;
     }
@@ -200,6 +205,17 @@
       font-size: 14px;
       line-height: 1.5;
       margin-top: 12px;
+    }
+
+    .note strong {
+      color: #ffd84d;
+    }
+
+    code {
+      color: #e6e6e6;
+      background: #1b1c1f;
+      padding: 1px 4px;
+      border-radius: 4px;
     }
   </style>
 </head>
@@ -243,17 +259,18 @@
       <div><span class="badge">Start</span> <span id="startText">없음</span></div>
       <div><span class="badge">End</span> <span id="endText">없음</span></div>
       <div><span class="badge">Piece</span> <span id="pieceText">없음</span></div>
+      <div><span class="badge">Turn</span> <span id="turnText">확인 중</span></div>
     </div>
 
-    <button onclick="sendMove()">Move</button>
-    <button class="secondary" onclick="resetSelection()">Selection Reset</button>
-    <button class="danger" onclick="resetBoard()">Board Reset</button>
+    <button id="moveBtn" onclick="sendMove()">Move</button>
+    <button id="selectionResetBtn" class="secondary" onclick="resetSelection()">Selection Reset</button>
+    <button id="boardResetBtn" class="danger" onclick="resetBoard()">Board Reset</button>
 
     <div class="note">
-      현재 규칙 검사는 TOPST UART 연동 후 담당 예정.<br>
-      지금 UI는 선택한 기물의 start/end/piece를 FastAPI로 보내고,
-      서버가 <code>execute_move_8x8.sh</code>를 실행함.<br>
-      실제 보드에서 목적 칸에 블록이 있으면 충돌할 수 있으니 시연 때는 목적 칸을 비워두는 게 안전함.
+      <strong>TOPST D3 rule checker</strong>와 <strong>ROS2 dual Mirobot control</strong>이 연동된 체스 로봇 데모입니다.<br>
+      기물을 선택한 뒤 목적지를 선택하면 TOPST가 현재 보드 상태와 이동 규칙을 검사하고,
+      유효한 이동일 때만 로봇팔이 실제 기물을 이동합니다.<br>
+      이 화면은 TOPST의 <code>board_state</code>를 기준으로 동기화됩니다.
     </div>
 
     <div id="log">log...</div>
@@ -264,10 +281,19 @@
     const startText = document.getElementById("startText");
     const endText = document.getElementById("endText");
     const pieceText = document.getElementById("pieceText");
+    const turnText = document.getElementById("turnText");
     const logEl = document.getElementById("log");
+
+    const moveBtn = document.getElementById("moveBtn");
+    const selectionResetBtn = document.getElementById("selectionResetBtn");
+    const boardResetBtn = document.getElementById("boardResetBtn");
 
     let selectedStart = null;
     let selectedEnd = null;
+    let boardState = {};
+    let currentTurn = "unknown";
+    let currentPending = "unknown";
+    let busy = false;
 
     const initialBoard = {
       A1: { symbol: "♖", type: "rook", color: "white" },
@@ -307,13 +333,39 @@
       H7: { symbol: "♟", type: "pawn", color: "black" },
     };
 
-    let boardState = {};
+    const pieceSymbols = {
+      white: {
+        king: "♔",
+        queen: "♕",
+        rook: "♖",
+        bishop: "♗",
+        knight: "♘",
+        pawn: "♙",
+      },
+      black: {
+        king: "♚",
+        queen: "♛",
+        rook: "♜",
+        bishop: "♝",
+        knight: "♞",
+        pawn: "♟",
+      },
+    };
 
     function cloneInitialBoard() {
       boardState = {};
       for (const cell in initialBoard) {
         boardState[cell] = { ...initialBoard[cell] };
       }
+      currentTurn = "white";
+      currentPending = "none";
+    }
+
+    function setBusy(value) {
+      busy = value;
+      moveBtn.disabled = value;
+      selectionResetBtn.disabled = value;
+      boardResetBtn.disabled = value;
     }
 
     function cellColor(fileIndex, rank) {
@@ -360,6 +412,11 @@
     }
 
     function handleCellClick(cell) {
+      if (busy) {
+        log("처리 중임. 잠깐 기다려줘.");
+        return;
+      }
+
       if (!selectedStart) {
         if (!boardState[cell]) {
           log(`빈 칸 ${cell}은 시작 칸으로 선택할 수 없음`);
@@ -391,28 +448,176 @@
       } else {
         pieceText.textContent = "없음";
       }
+
+      if (currentPending && currentPending !== "none") {
+        turnText.textContent = `${currentTurn} / pending=${currentPending}`;
+      } else {
+        turnText.textContent = currentTurn || "unknown";
+      }
     }
 
     function resetSelection() {
+      if (busy) {
+        return;
+      }
+
       selectedStart = null;
       selectedEnd = null;
       renderBoard();
       log("selection reset");
     }
 
-    function resetBoard() {
-      cloneInitialBoard();
-      selectedStart = null;
-      selectedEnd = null;
-      renderBoard();
-      log("board reset");
-    }
-
     function log(message) {
       logEl.textContent = message;
     }
 
+    function pieceFromTopstValue(value) {
+      const parts = value.split("_");
+      const color = parts[0];
+      const type = parts.slice(1).join("_");
+
+      if (!pieceSymbols[color] || !pieceSymbols[color][type]) {
+        return {
+          symbol: "?",
+          type: type || "unknown",
+          color: color || "unknown",
+        };
+      }
+
+      return {
+        symbol: pieceSymbols[color][type],
+        type,
+        color,
+      };
+    }
+
+    function parseTopstBoardResponse(responseText) {
+      const nextBoard = {};
+      let nextTurn = "unknown";
+      let nextPending = "unknown";
+
+      const tokens = responseText.trim().split(/\s+/);
+
+      for (const token of tokens) {
+        if (token.startsWith("turn=")) {
+          nextTurn = token.slice("turn=".length);
+          continue;
+        }
+
+        if (token.startsWith("pending=")) {
+          nextPending = token.slice("pending=".length);
+          continue;
+        }
+
+        if (/^[A-H][1-8]:/.test(token)) {
+          const pair = token.split(":");
+          const cell = pair[0];
+          const pieceValue = pair[1];
+
+          if (cell && pieceValue) {
+            nextBoard[cell] = pieceFromTopstValue(pieceValue);
+          }
+        }
+      }
+
+      return {
+        board: nextBoard,
+        turn: nextTurn,
+        pending: nextPending,
+      };
+    }
+
+    async function readJsonResponse(res) {
+      const text = await res.text();
+
+      try {
+        return JSON.parse(text);
+      } catch (err) {
+        return {
+          status: "error",
+          raw_text: text,
+        };
+      }
+    }
+
+    async function loadBoardFromTopst(showLog = true) {
+      if (showLog) {
+        log("TOPST board sync...");
+      }
+
+      const res = await fetch("/topst/board", {
+        method: "GET",
+        cache: "no-store",
+      });
+
+      const data = await readJsonResponse(res);
+
+      if (!res.ok) {
+        throw new Error(JSON.stringify(data, null, 2));
+      }
+
+      if (!data.response) {
+        throw new Error("TOPST board response is empty: " + JSON.stringify(data, null, 2));
+      }
+
+      const parsed = parseTopstBoardResponse(data.response);
+
+      boardState = parsed.board;
+      currentTurn = parsed.turn;
+      currentPending = parsed.pending;
+
+      selectedStart = null;
+      selectedEnd = null;
+      renderBoard();
+
+      if (showLog) {
+        log("BOARD SYNC SUCCESS\n" + data.response);
+      }
+
+      return data;
+    }
+
+    async function resetBoard() {
+      if (busy) {
+        return;
+      }
+
+      setBusy(true);
+      log("TOPST board reset...");
+
+      try {
+        const res = await fetch("/topst/reset", {
+          method: "POST",
+          cache: "no-store",
+        });
+
+        const data = await readJsonResponse(res);
+
+        if (!res.ok) {
+          log("TOPST RESET ERROR\n" + JSON.stringify(data, null, 2));
+          return;
+        }
+
+        const boardData = await loadBoardFromTopst(false);
+
+        log(
+          "TOPST RESET SUCCESS\n" +
+          JSON.stringify(data, null, 2) +
+          "\n\nBOARD SYNC\n" +
+          boardData.response
+        );
+      } catch (err) {
+        log("TOPST RESET FETCH ERROR\n" + err);
+      } finally {
+        setBusy(false);
+      }
+    }
+
     async function sendMove() {
+      if (busy) {
+        return;
+      }
+
       if (!selectedStart || !selectedEnd) {
         alert("시작 칸과 도착 칸을 선택하셈");
         return;
@@ -431,6 +636,7 @@
         piece: movingPiece.type,
       };
 
+      setBusy(true);
       log(`executing ${payload.start} -> ${payload.end} (${payload.piece}) ...`);
 
       try {
@@ -439,31 +645,51 @@
           headers: {
             "Content-Type": "application/json",
           },
+          cache: "no-store",
           body: JSON.stringify(payload),
         });
 
-        const data = await res.json();
+        const data = await readJsonResponse(res);
 
         if (!res.ok) {
-          log("ERROR\n" + JSON.stringify(data, null, 2));
+          let message = "ERROR\n" + JSON.stringify(data, null, 2);
+
+          try {
+            const boardData = await loadBoardFromTopst(false);
+            message += "\n\nBOARD SYNC AFTER ERROR\n" + boardData.response;
+          } catch (syncErr) {
+            message += "\n\nBOARD SYNC FAILED\n" + syncErr;
+          }
+
+          log(message);
           return;
         }
 
-        boardState[selectedEnd] = boardState[selectedStart];
-        delete boardState[selectedStart];
+        const boardData = await loadBoardFromTopst(false);
 
-        selectedStart = null;
-        selectedEnd = null;
-        renderBoard();
-
-        log("SUCCESS\n" + JSON.stringify(data, null, 2));
+        log(
+          "SUCCESS\n" +
+          JSON.stringify(data, null, 2) +
+          "\n\nBOARD SYNC\n" +
+          boardData.response
+        );
       } catch (err) {
         log("FETCH ERROR\n" + err);
+      } finally {
+        setBusy(false);
       }
     }
 
     cloneInitialBoard();
     renderBoard();
+
+    loadBoardFromTopst(true).catch((err) => {
+      log(
+        "BOARD SYNC ERROR\n" +
+        err +
+        "\n\n로컬 초기 보드가 임시로 표시되고 있음. TOPST rule_checker 또는 /topst/board 상태를 확인해야 함."
+      );
+    });
   </script>
 </body>
 </html>

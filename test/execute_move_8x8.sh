@@ -1,32 +1,38 @@
 #!/bin/bash
 
+# Usage:
+#   ./test/execute_move_8x8.sh A2 A4 pawn
+#   ./test/execute_move_8x8.sh A7 A5 pawn
+#   ./test/execute_move_8x8.sh A2 A6 pawn
+#
+# Role:
+#   This script only decides direct vs relay and calls move_piece_8x8.sh.
+#   It must NOT set Z values, home values, or raw_cmd directly.
+#   All actual robot movement, Z, suction, timing, and home return are handled by move_piece_8x8.sh.
+
 START=${1^^}
 END=${2^^}
-PIECE=${3:-piece}
-
-export Z_UP=${Z_UP:-90}
-export Z_PICK=${Z_PICK:-59}
-export Z_PLACE=${Z_PLACE:-60}
-export HOME_Z=${HOME_Z:-90}
-
-export F_FAST=${F_FAST:-1800}
-export F_SLOW=${F_SLOW:-600}
-export F_HOME=${F_HOME:-1800}
-
-export SLEEP_TIME=${SLEEP_TIME:-0.15}
-export RELEASE_SLEEP=${RELEASE_SLEEP:-0.1}
-
-SCRIPT_DIR="/root/chess_robot_project/ros_ws/test"
-MOVE_SCRIPT="${SCRIPT_DIR}/move_piece_8x8.sh"
-HOME_SCRIPT="${SCRIPT_DIR}/goto_home.sh"
+PIECE=${3,,}
 
 if [ -z "$START" ] || [ -z "$END" ]; then
-  echo "Usage: ./test/execute_move_8x8.sh START END [piece]"
-  echo "Example: ./test/execute_move_8x8.sh A1 G7 bishop"
+  echo "Usage: $0 START END [piece]"
+  echo "Example: $0 A2 A4 pawn"
   exit 1
 fi
 
-file_idx() {
+if [ -z "$PIECE" ]; then
+  PIECE="piece"
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MOVE_SCRIPT="${SCRIPT_DIR}/move_piece_8x8.sh"
+
+if [ ! -x "$MOVE_SCRIPT" ]; then
+  echo "ERROR: move script not executable or not found: $MOVE_SCRIPT"
+  exit 1
+fi
+
+file_index() {
   case "$1" in
     A) echo 0 ;;
     B) echo 1 ;;
@@ -36,55 +42,31 @@ file_idx() {
     F) echo 5 ;;
     G) echo 6 ;;
     H) echo 7 ;;
-    *) echo "ERR" ;;
+    *)
+      echo "ERROR"
+      ;;
   esac
 }
 
-idx_file() {
-  case "$1" in
-    0) echo A ;;
-    1) echo B ;;
-    2) echo C ;;
-    3) echo D ;;
-    4) echo E ;;
-    5) echo F ;;
-    6) echo G ;;
-    7) echo H ;;
-    *) echo "ERR" ;;
-  esac
-}
+validate_cell() {
+  local CELL="$1"
+  local FILE="${CELL:0:1}"
+  local RANK="${CELL:1}"
 
-check_cell() {
-  CELL=$1
-  FILE=${CELL:0:1}
-  RANK=${CELL:1:1}
-
-  IDX=$(file_idx "$FILE")
-
-  if [ "$IDX" = "ERR" ]; then
-    echo "Invalid file: $CELL"
+  if ! [[ "$FILE" =~ ^[A-H]$ ]]; then
+    echo "ERROR: invalid file in cell $CELL"
     exit 1
   fi
 
   if ! [[ "$RANK" =~ ^[1-8]$ ]]; then
-    echo "Invalid rank: $CELL"
+    echo "ERROR: invalid rank in cell $CELL"
     exit 1
   fi
 }
 
-get_file() {
-  CELL=$1
-  echo "${CELL:0:1}"
-}
-
-get_rank() {
-  CELL=$1
-  echo "${CELL:1:1}"
-}
-
-get_arm_by_rank() {
-  CELL=$1
-  RANK=$(get_rank "$CELL")
+arm_for_cell() {
+  local CELL="$1"
+  local RANK="${CELL:1}"
 
   if [ "$RANK" -le 4 ]; then
     echo "arm1"
@@ -94,18 +76,26 @@ get_arm_by_rank() {
 }
 
 choose_relay() {
-  START_CELL=$1
-  END_CELL=$2
+  local START_CELL="$1"
+  local END_CELL="$2"
 
-  SFILE=$(get_file "$START_CELL")
-  EFILE=$(get_file "$END_CELL")
+  local SFILE="${START_CELL:0:1}"
+  local EFILE="${END_CELL:0:1}"
 
-  SIDX=$(file_idx "$SFILE")
-  EIDX=$(file_idx "$EFILE")
+  local SIDX
+  local EIDX
+  SIDX=$(file_index "$SFILE")
+  EIDX=$(file_index "$EFILE")
 
-  AVG=$(((SIDX + EIDX) / 2))
+  if [ "$SIDX" = "ERROR" ] || [ "$EIDX" = "ERROR" ]; then
+    echo "ERROR"
+    return 1
+  fi
 
-  # relay는 C45~F45만 사용
+  # Pick a relay file near the average file, clamped to C~F.
+  # C=2, D=3, E=4, F=5
+  local AVG=$(((SIDX + EIDX) / 2))
+
   if [ "$AVG" -lt 2 ]; then
     AVG=2
   fi
@@ -114,60 +104,72 @@ choose_relay() {
     AVG=5
   fi
 
-  RFILE=$(idx_file "$AVG")
-  echo "${RFILE}45"
+  case "$AVG" in
+    2) echo "C45" ;;
+    3) echo "D45" ;;
+    4) echo "E45" ;;
+    5) echo "F45" ;;
+    *)
+      echo "D45"
+      ;;
+  esac
 }
 
-check_cell "$START"
-check_cell "$END"
+run_move() {
+  local ARM="$1"
+  local FROM="$2"
+  local TO="$3"
 
-PIECE=$(echo "$PIECE" | tr '[:upper:]' '[:lower:]')
+  echo "RUN: $MOVE_SCRIPT $ARM $FROM $TO"
+  "$MOVE_SCRIPT" "$ARM" "$FROM" "$TO"
 
-START_ARM=$(get_arm_by_rank "$START")
-END_ARM=$(get_arm_by_rank "$END")
+  local RC=$?
+  if [ "$RC" -ne 0 ]; then
+    echo "ERROR: move failed: $ARM $FROM -> $TO"
+    exit "$RC"
+  fi
+}
 
-echo "======================================"
-echo "EXECUTE 8x8 FAST MOVE"
-echo "START: $START"
-echo "END:   $END"
-echo "PIECE: $PIECE"
-echo "START_ARM: $START_ARM"
-echo "END_ARM:   $END_ARM"
-echo "Z_UP=$Z_UP Z_PICK=$Z_PICK Z_PLACE=$Z_PLACE HOME_Z=$HOME_Z"
-echo "F_FAST=$F_FAST F_SLOW=$F_SLOW F_HOME=$F_HOME"
-echo "SLEEP_TIME=$SLEEP_TIME RELEASE_SLEEP=$RELEASE_SLEEP"
-echo "NOTE: piece rule validation is handled by TOPST before robot execution."
-echo "======================================"
+validate_cell "$START"
+validate_cell "$END"
 
-echo "[INIT] Move both arms home"
-"$HOME_SCRIPT" arm1 "$HOME_Z"
-"$HOME_SCRIPT" arm2 "$HOME_Z"
+if [ "$START" = "$END" ]; then
+  echo "ERROR: START and END are the same: $START"
+  exit 1
+fi
+
+START_ARM=$(arm_for_cell "$START")
+END_ARM=$(arm_for_cell "$END")
+
+echo "START=$START"
+echo "END=$END"
+echo "PIECE=$PIECE"
+echo "START_ARM=$START_ARM"
+echo "END_ARM=$END_ARM"
 
 if [ "$START_ARM" = "$END_ARM" ]; then
-  echo "[MODE] direct"
-  echo "[STEP 1] $START_ARM: $START -> $END"
-
-  "$MOVE_SCRIPT" "$START_ARM" "$START" "$END"
-
-  echo "[DONE] direct move complete"
+  echo "MODE=direct"
+  run_move "$START_ARM" "$START" "$END"
+  echo "DONE: direct $START -> $END"
   exit 0
 fi
 
 RELAY=$(choose_relay "$START" "$END")
 
-echo "[MODE] relay"
-echo "[RELAY] selected relay point: $RELAY"
-echo "[STEP 1] $START_ARM: $START -> $RELAY"
-echo "[STEP 2] $END_ARM:   $RELAY -> $END"
+if [ "$RELAY" = "ERROR" ] || [ -z "$RELAY" ]; then
+  echo "ERROR: failed to choose relay"
+  exit 1
+fi
 
-"$MOVE_SCRIPT" "$START_ARM" "$START" "$RELAY"
+echo "MODE=relay"
+echo "RELAY=$RELAY"
 
-# move_piece_8x8.sh already returns the arm home.
-# Do not call goto_home again here.
+# Relay sequence:
+# 1. start-side arm moves start -> relay
+# 2. move_piece_8x8.sh returns that arm home
+# 3. end-side arm moves relay -> end
+# 4. move_piece_8x8.sh returns that arm home
+run_move "$START_ARM" "$START" "$RELAY"
+run_move "$END_ARM" "$RELAY" "$END"
 
-"$MOVE_SCRIPT" "$END_ARM" "$RELAY" "$END"
-
-# move_piece_8x8.sh already returns the arm home.
-# Do not call goto_home again here.
-
-echo "[DONE] relay move complete"
+echo "DONE: relay $START -> $RELAY -> $END"
