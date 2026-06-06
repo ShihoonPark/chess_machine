@@ -136,17 +136,51 @@ regular_cell_xy() {
     X=$((170 + ((RANK - 2) * 75) / 2 + IDX))
     Y=$((145 + ((RANK - 2) * 1) / 2 - (IDX * 284) / 7))
   else
-    # arm2 calibration:
-    #   H7 = X165 Y150
-    #   H5 = X245 Y150
-    #   A7 = X180 Y-131
+    # arm2 recalibration:
+    #   Use measured A-D-H anchor points for each rank.
+    #   A~D and D~H are interpolated separately to handle board skew.
     #
-    # rank direction:
-    #   rank decreases by 1 -> X +40
-    # file direction:
-    #   A -> H = X -15, Y +281
-    X=$((180 + (7 - RANK) * 40 - (IDX * 15) / 7))
-    Y=$((-131 + (IDX * 281) / 7))
+    # measured anchors:
+    #   A8 = X145 Y-130, D8 = X137 Y-10, H8 = X122 Y153
+    #   A7 = X185 Y-127, D7 = X177 Y-6,  H7 = X160 Y155
+    #   A6 = X225 Y-125, D6 = X215 Y-3,  H6 = X202 Y157
+    #   A5 = X260 Y-125, D5 = X253 Y0,   H5 = X242 Y159
+    local AX
+    local AY
+    local DX
+    local DY
+    local HX
+    local HY
+
+    case "$RANK" in
+      8)
+        AX=145; AY=-130; DX=137; DY=-10; HX=122; HY=153
+        ;;
+      7)
+        AX=185; AY=-127; DX=177; DY=-6; HX=160; HY=155
+        ;;
+      6)
+        AX=225; AY=-125; DX=215; DY=-3; HX=202; HY=157
+        ;;
+      5)
+        AX=260; AY=-125; DX=253; DY=0; HX=242; HY=159
+        ;;
+      *)
+        echo "ERROR: arm2 regular-cell calibration supports ranks 5~8 only: $CELL" >&2
+        return 1
+        ;;
+    esac
+
+    if [ "$IDX" -le 3 ]; then
+      # A(0) -> D(3)
+      X=$((AX + ((DX - AX) * IDX) / 3))
+      Y=$((AY + ((DY - AY) * IDX) / 3))
+    else
+      # D(3) -> H(7)
+      local T=$((IDX - 3))
+      X=$((DX + ((HX - DX) * T) / 4))
+      Y=$((DY + ((HY - DY) * T) / 4))
+    fi
   fi
 
   echo "$X $Y"
@@ -172,10 +206,10 @@ relay_xy() {
     # arm2 relay measured directly.
     # Y values were adjusted +5 from the earlier candidates.
     case "$RELAY" in
-      C45) echo "277 -46" ;;
-      D45) echo "277 -6" ;;
-      E45) echo "277 34" ;;
-      F45) echo "275 74" ;;
+      C45) echo "277 -40" ;;
+      D45) echo "276 1" ;;
+      E45) echo "273 42" ;;
+      F45) echo "270 82" ;;
       *)
         echo "ERROR: invalid relay $RELAY" >&2
         return 1
@@ -246,11 +280,24 @@ START_Y=$(echo "$START_XY" | awk '{print $2}')
 END_X=$(echo "$END_XY" | awk '{print $1}')
 END_Y=$(echo "$END_XY" | awk '{print $2}')
 
+EFFECTIVE_Z_PICK="$Z_PICK"
+EFFECTIVE_Z_PLACE="$Z_PLACE"
+
+# arm2 A-file measured pickup correction.
+# Keep place height unchanged until separate place tests require an override.
+if [ "$ARM" = "arm2" ]; then
+  case "$START" in
+    A5|A6|A7|A8)
+      EFFECTIVE_Z_PICK=76
+      ;;
+  esac
+fi
+
 echo "ARM: $ARM"
 echo "TOPIC: $TOPIC"
 echo "START: $START -> X$START_X Y$START_Y"
 echo "END:   $END -> X$END_X Y$END_Y"
-echo "Z_UP=$Z_UP Z_PICK=$Z_PICK Z_PLACE=$Z_PLACE HOME_Z=$HOME_Z"
+echo "Z_UP=$Z_UP Z_PICK=$Z_PICK EFFECTIVE_Z_PICK=$EFFECTIVE_Z_PICK Z_PLACE=$Z_PLACE EFFECTIVE_Z_PLACE=$EFFECTIVE_Z_PLACE HOME_Z=$HOME_Z"
 echo "F_FAST=$F_FAST F_SLOW=$F_SLOW F_HOME=$F_HOME"
 echo "SLEEP_TIME=$SLEEP_TIME"
 echo "TRAVEL_SLEEP=$TRAVEL_SLEEP PICK_SETTLE_SLEEP=$PICK_SETTLE_SLEEP SUCTION_SLEEP=$SUCTION_SLEEP"
@@ -265,7 +312,7 @@ send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$Z_UP A0 B0 C0 F$F_FAST"
 sleep "$TRAVEL_SLEEP"
 
 # Move down to pick height.
-send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$Z_PICK A0 B0 C0 F$F_SLOW"
+send_cmd "M20 G90 G0 X$START_X Y$START_Y Z$EFFECTIVE_Z_PICK A0 B0 C0 F$F_SLOW"
 sleep "$PICK_SETTLE_SLEEP"
 
 # Suction on and wait until the block is attached.
@@ -281,7 +328,7 @@ send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$Z_UP A0 B0 C0 F$F_FAST"
 sleep "$TRAVEL_SLEEP"
 
 # Move down to place height.
-send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$Z_PLACE A0 B0 C0 F$F_SLOW"
+send_cmd "M20 G90 G0 X$END_X Y$END_Y Z$EFFECTIVE_Z_PLACE A0 B0 C0 F$F_SLOW"
 sleep "$PLACE_SETTLE_SLEEP"
 
 # Suction off and wait until the block is released.
